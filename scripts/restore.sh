@@ -8,37 +8,41 @@
 #   scripts/restore.sh --package PKG    re-enable a single package only.
 #   scripts/restore.sh --dry-run        show what would change, change nothing.
 #
-# Optional: ANDROID_SERIAL=ip:5555 (default 192.168.0.222:5555), BACKUP=backup/<stamp>.
+# Without a backup (e.g. it was taken on another computer) it re-enables every package in
+# debloat-list.txt instead.
+#
+# Optional: ANDROID_SERIAL=ip:5555, BACKUP=backup/<stamp>.
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(dirname "$DIR")"
-export PATH="$HOME/Library/Android/sdk/platform-tools:$PATH"
-export ANDROID_SERIAL="${ANDROID_SERIAL:-192.168.0.222:5555}"
-BACKUP="${BACKUP:-$ROOT/$(cat "$ROOT/backup/LATEST")}"
+. "$DIR/common.sh"
+BACKUP="${BACKUP:-}"
+[ -n "$BACKUP" ] || [ ! -f "$ROOT/backup/LATEST" ] || BACKUP="$ROOT/$(cat "$ROOT/backup/LATEST")"
 STOCK_HOME="com.google.android.tvlauncher/.MainActivity"
 
-DRY=0; UNINSTALL_ZEN=0; ONLY=""
+DRY="$DRY_RUN"; UNINSTALL_ZEN=0; ONLY=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1 ;;
     --uninstall-zen) UNINSTALL_ZEN=1 ;;
     --package) ONLY="$2"; shift ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
     *) echo "unknown option: $1"; exit 2 ;;
   esac
   shift
 done
 
-run() { if [ $DRY = 1 ]; then echo "  [dry-run] adb shell $*"; else adb shell "$@" </dev/null; fi; }
+run() { if [ "$DRY" = 1 ]; then echo "  [dry-run] adb shell $*"; else adb shell "$@" </dev/null; fi; }
 
-adb connect "$ANDROID_SERIAL" >/dev/null 2>&1 || true
-[ "$(adb get-state 2>/dev/null)" = device ] || {
-  echo "SHIELD not reachable at $ANDROID_SERIAL."
-  echo "Turn on Settings > Device Preferences > Developer options > Network debugging, then retry."
-  exit 1
-}
-[ -f "$BACKUP/packages_disabled.txt" ] || { echo "Backup not found: $BACKUP"; exit 1; }
-echo "Using backup: $BACKUP"
+shield_connect
+if [ -n "$BACKUP" ] && [ -f "$BACKUP/packages_disabled.txt" ]; then
+  echo "Using backup: $BACKUP"
+  originally_disabled="$(sed 's/^package://' "$BACKUP/packages_disabled.txt" | tr -d '\r')"
+else
+  [ -z "$BACKUP" ] || echo "Backup not found: $BACKUP"
+  echo "No backup: re-enabling every package in debloat-list.txt instead."
+  originally_disabled=""
+  BACKUP=""
+fi
 
 if [ -n "$ONLY" ]; then
   run pm enable "$ONLY"
@@ -46,10 +50,12 @@ if [ -n "$ONLY" ]; then
 fi
 
 # Packages disabled now that were NOT disabled in the backup -> re-enable.
-originally_disabled="$(sed 's/^package://' "$BACKUP/packages_disabled.txt" | tr -d '\r')"
+# Without a backup, only packages from debloat-list.txt are touched.
 now_disabled="$(adb shell pm list packages -d </dev/null | sed 's/^package://' | tr -d '\r')"
+ours="$(grep -vE '^\s*(#|$)' "$DIR/debloat-list.txt" | sed 's/#.*//' | xargs -n1)"
 count=0
 for pkg in $now_disabled; do
+  if [ -z "$BACKUP" ] && ! grep -qx "$pkg" <<<"$ours"; then continue; fi
   if ! grep -qx "$pkg" <<<"$originally_disabled"; then
     echo "re-enable: $pkg"
     run pm enable "$pkg"
@@ -63,13 +69,14 @@ run cmd package set-home-activity --user 0 "$STOCK_HOME"
 
 if [ $UNINSTALL_ZEN = 1 ]; then
   echo "uninstall Zen Home"
-  if [ $DRY = 1 ]; then echo "  [dry-run] adb uninstall com.zen.home"; else adb uninstall com.zen.home || true; fi
+  if [ "$DRY" = 1 ]; then echo "  [dry-run] adb uninstall com.zen.home"; else adb uninstall com.zen.home || true; fi
 fi
 
-if [ $DRY = 0 ]; then
+if [ "$DRY" = 0 ]; then
   run input keyevent KEYCODE_HOME
   echo
   echo "Home now resolves to: $(adb shell cmd package resolve-activity --brief -c android.intent.category.HOME -a android.intent.action.MAIN </dev/null | tail -1 | tr -d '\r')"
+  [ -n "$BACKUP" ] || exit 0
   diff <(sed 's/^package://' "$BACKUP/packages_disabled.txt" | tr -d '\r' | sort) \
        <(adb shell pm list packages -d </dev/null | sed 's/^package://' | tr -d '\r' | sort) \
     && echo "Disabled-package list matches the backup exactly." \

@@ -2,7 +2,7 @@
 # Builds Zen Home without Gradle: aapt2 -> javac -> d8 -> zipalign -> apksigner.
 set -euo pipefail
 cd "$(dirname "$0")"
-SDK="$HOME/Library/Android/sdk"
+SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
 BT="$SDK/build-tools/35.0.1"
 JAR="$SDK/platforms/android-30/android.jar"
 [ -f "$JAR" ] || JAR="$SDK/platforms/android-33/android.jar"

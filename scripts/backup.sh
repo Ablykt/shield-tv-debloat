@@ -5,12 +5,9 @@
 # Usage: scripts/backup.sh [--set-latest]
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(dirname "$DIR")"
-export PATH="$HOME/Library/Android/sdk/platform-tools:$PATH"
-export ANDROID_SERIAL="${ANDROID_SERIAL:-192.168.0.222:5555}"
+. "$DIR/common.sh"
 
-adb connect "$ANDROID_SERIAL" >/dev/null 2>&1 || true
-[ "$(adb get-state 2>/dev/null)" = device ] || { echo "SHIELD not reachable at $ANDROID_SERIAL"; exit 1; }
+shield_connect
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
 B="$ROOT/backup/$STAMP"

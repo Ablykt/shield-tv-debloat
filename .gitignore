@@ -11,3 +11,8 @@ launcher/keystore/
 launcher/build/
 
 .DS_Store
+
+# Local state: where your SHIELD was found, downloaded adb and Zen Home
+.shield-address
+tools/
+downloads/

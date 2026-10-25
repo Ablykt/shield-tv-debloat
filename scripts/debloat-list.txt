@@ -1,10 +1,12 @@
-# Packages disabled (pm disable-user) on Jorge's SHIELD TV Pro 2019 (mdarcy, Android 11).
+# Packages disabled (pm disable-user). Tested on a SHIELD TV Pro 2019 (mdarcy, Android 11);
+# packages a model doesn't have are skipped.
 # Nothing is ever uninstalled. Re-enable any line with:
 #   adb shell pm enable <package>
 # or run scripts/restore.sh to put everything back.
 #
 # Format: <package>  # reason
 # Lines tagged [phase2] are only disabled after the new launcher is the default home.
+# To keep something: delete its line, or pass --keep <package>[,<package>] to setup.sh.
 
 # --- NVIDIA telemetry / junk ---
 com.nvidia.stats                          # telemetry uploader (~54 MB resident)
@@ -20,12 +22,12 @@ com.nvidia.factory                        # factory helper
 com.nvidia.factorybundling                # factory app bundling (promo installs)
 com.nvidia.factorysyschecker              # factory system checker
 android.autoinstalls.config.nvidia        # Play auto-install of promo apps
-com.nvidia.nvgamecast                     # NVIDIA Share / Gamecast (user: not used)
+com.nvidia.nvgamecast                     # NVIDIA Share / Gamecast recording & streaming
 
 # --- Google junk ---
 com.google.android.feedback               # Google feedback / crash reports
 com.android.printspooler                  # printing (no printers on a TV)
-com.google.android.tv                     # Live Channels (user: not used)
+com.google.android.tv                     # Live Channels (TV tuner / channel guide)
 com.google.android.music                  # Google Play Music (service dead since 2020)
 com.google.android.videos                 # Google TV / Play Movies store
 com.google.android.youtube.tvunplugged    # YouTube TV

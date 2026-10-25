@@ -1,18 +1,46 @@
 #!/usr/bin/env bash
-# Re-apply the whole setup (e.g. after restore.sh or a factory reset):
+# The whole setup (also after restore.sh or a factory reset):
 # debloat phase 1 -> install Zen Home -> make it home -> disable the stock launcher (phase 2).
+# Uses launcher/build/ZenHome.apk if you built it, otherwise the latest GitHub release.
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(dirname "$DIR")"
-export PATH="$HOME/Library/Android/sdk/platform-tools:$PATH"
-export ANDROID_SERIAL="${ANDROID_SERIAL:-192.168.0.222:5555}"
-APK="$ROOT/launcher/build/ZenHome.apk"
+. "$DIR/common.sh"
+HOME_ACTIVITY="com.zen.home/.HomeActivity"
 
-[ -f "$APK" ] || "$ROOT/launcher/build.sh"
+shield_connect
+
+APK="$ROOT/launcher/build/ZenHome.apk"
+if [ ! -f "$APK" ]; then
+  APK="$ROOT/downloads/ZenHome.apk"
+  step "Downloading Zen Home"
+  if [ "$DRY_RUN" = 1 ]; then
+    say "  [dry-run] download $APK_URL"
+  else
+    mkdir -p "$ROOT/downloads"
+    if curl -fL --progress-bar -o "$APK.part" "$APK_URL"; then
+      mv "$APK.part" "$APK"
+    else
+      rm -f "$APK.part"
+      if [ -f "$APK" ]; then warn "Download failed; using the copy downloaded earlier."
+      else
+        warn "Download failed; building Zen Home from source instead (needs the Android SDK)."
+        "$ROOT/launcher/build.sh"
+        APK="$ROOT/launcher/build/ZenHome.apk"
+      fi
+    fi
+  fi
+fi
+
+step "Disabling telemetry and bloat"
 "$DIR/debloat.sh" phase1
-adb install -r "$APK"
-adb shell cmd package set-home-activity --user 0 com.zen.home/.HomeActivity </dev/null
+
+step "Installing Zen Home"
+if [ "$DRY_RUN" = 1 ]; then say "  [dry-run] adb install -r $APK"
+else adb install -r "$APK" </dev/null; fi
+shell_run cmd package set-home-activity --user 0 "$HOME_ACTIVITY"
+
+step "Disabling the stock launcher and its ad feed"
 "$DIR/debloat.sh" phase2
-adb shell cmd package set-home-activity --user 0 com.zen.home/.HomeActivity </dev/null
-adb shell input keyevent KEYCODE_HOME </dev/null
-echo "Home now resolves to: $(adb shell cmd package resolve-activity --brief -c android.intent.category.HOME -a android.intent.action.MAIN </dev/null | tail -1)"
+shell_run cmd package set-home-activity --user 0 "$HOME_ACTIVITY"
+shell_run input keyevent KEYCODE_HOME
+[ "$DRY_RUN" = 1 ] || say "Home now resolves to: $(adb shell cmd package resolve-activity --brief -c android.intent.category.HOME -a android.intent.action.MAIN </dev/null | tail -1 | tr -d '\r')"
