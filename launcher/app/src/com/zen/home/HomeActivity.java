@@ -33,9 +33,6 @@ import android.widget.LinearLayout;
 import android.widget.TextClock;
 import android.widget.TextView;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -82,7 +79,6 @@ public final class HomeActivity extends Activity implements WallpaperView.Listen
     private WideLayout dockRow;
     private LinearLayout grid;
     private TextView captionTitle, captionCredit, dockEmpty, dockName, greeting, moveHint;
-    private final List<String[]> captions = new ArrayList<>();
 
     private final Map<String, AppRepo.App> apps = new LinkedHashMap<>();
     private final List<String> dock = new ArrayList<>();
@@ -91,7 +87,7 @@ public final class HomeActivity extends Activity implements WallpaperView.Listen
     private boolean showHidden;
     private AppTile moving;
     private Dialog menu;
-    private boolean okHeld, glassReady, menuArmed;
+    private boolean okHeld, glassReady, menuArmed, dockNameShown = true;
     private Sounds sounds;
     private float dockTargetX;
 
@@ -109,6 +105,12 @@ public final class HomeActivity extends Activity implements WallpaperView.Listen
     private final BroadcastReceiver tilesReady = new BroadcastReceiver() {
         @Override public void onReceive(Context c, Intent i) {
             readCachedTiles();
+        }
+    };
+
+    private final BroadcastReceiver wallpapersReady = new BroadcastReceiver() {
+        @Override public void onReceive(Context c, Intent i) {
+            wall.reloadIfChanged();
         }
     };
 
@@ -132,7 +134,6 @@ public final class HomeActivity extends Activity implements WallpaperView.Listen
         dockPadY = dp(14);
         dockViewportW = screenW - 2 * side - 2 * dockPadX;
         sizeDock(DEFAULT_DOCK.length);
-        loadCaptions();
         hidden.addAll(split(prefs.getString("hidden", "")));
 
         FrameLayout root = new FrameLayout(this);
@@ -183,6 +184,7 @@ public final class HomeActivity extends Activity implements WallpaperView.Listen
         registerReceiver(packagesChanged, f);
 
         registerReceiver(tilesReady, new IntentFilter(TileLoaderService.ACTION_READY));
+        registerReceiver(wallpapersReady, new IntentFilter(WallpaperFetcher.ACTION_READY));
 
         loadApps();
     }
@@ -190,7 +192,9 @@ public final class HomeActivity extends Activity implements WallpaperView.Listen
     @Override protected void onStart() {
         super.onStart();
         started = true;
+        wall.reloadIfChanged();
         wall.start();
+        WallpaperFetcher.schedule(this);
         sounds.wake();
         greetingTick.run();
         if (tilesStale) refreshTiles();
@@ -215,6 +219,7 @@ public final class HomeActivity extends Activity implements WallpaperView.Listen
     @Override protected void onDestroy() {
         unregisterReceiver(packagesChanged);
         unregisterReceiver(tilesReady);
+        unregisterReceiver(wallpapersReady);
         io.shutdownNow();
         sounds.release();
         super.onDestroy();
@@ -549,21 +554,10 @@ public final class HomeActivity extends Activity implements WallpaperView.Listen
         return out;
     }
 
-    private void loadCaptions() {
-        try (BufferedReader r = new BufferedReader(new InputStreamReader(
-                getAssets().open("wallpapers/captions.txt"), StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = r.readLine()) != null) {
-                String[] p = line.split("\\|", 2);
-                captions.add(new String[] { p[0], p.length > 1 ? p[1] : "" });
-            }
-        } catch (Exception ignored) { }
-    }
-
-    @Override public void onWallpaperShown(int index) {
-        for (GlassView g : glasses) g.setWallpaper("wallpapers/" + wall.file(index), glassReady ? 1800 : 0);
+    @Override public void onWallpaperShown(Wallpapers.Entry w) {
+        for (GlassView g : glasses) g.setWallpaper(w.path, glassReady ? 1800 : 0);
         glassReady = true;
-        final String[] c = index < captions.size() ? captions.get(index) : new String[] { "", "" };
+        final String[] c = { w.title, w.credit };
         captionTitle.animate().alpha(0f).setDuration(400).withEndAction(() -> {
             captionTitle.setText(c[0]);
             captionCredit.setText(c[1]);
@@ -589,8 +583,10 @@ public final class HomeActivity extends Activity implements WallpaperView.Listen
             int target = -(top - Math.round(screenH * 0.30f));
             int min = -Math.max(0, content.getHeight() - screenH);
             scrollContentTo(Math.max(min, Math.min(0, target)), 0.62f);
+            hideDockName();
         } else {
             scrollContentTo(0, 0f);
+            hideDockName(); // Search / Settings: the name belongs to a dock app, not to them
         }
     }
 
@@ -603,11 +599,21 @@ public final class HomeActivity extends Activity implements WallpaperView.Listen
     }
 
     private void showDockName(String name) {
-        if (name.contentEquals(dockName.getText())) return;
+        if (dockNameShown && name.contentEquals(dockName.getText())) return;
+        dockNameShown = true;
         dockName.animate().cancel();
-        dockName.setAlpha(0.25f);
-        dockName.setText(name);
+        if (!name.contentEquals(dockName.getText())) {
+            dockName.setAlpha(0.25f);
+            dockName.setText(name);
+        }
         dockName.animate().alpha(1f).setDuration(220).start();
+    }
+
+    private void hideDockName() {
+        if (!dockNameShown) return;
+        dockNameShown = false;
+        dockName.animate().cancel();
+        dockName.animate().alpha(0f).setDuration(160).start();
     }
 
     /** Scrolls a long dock inside the glass panel so the focused tile stays visible. */

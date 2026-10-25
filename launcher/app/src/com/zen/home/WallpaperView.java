@@ -18,8 +18,6 @@ import android.view.SurfaceView;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 
 /**
@@ -27,10 +25,11 @@ import java.util.List;
  * resolution (4K on a 4K TV), even though the Shield renders app UI at 1080p.
  * Bitmaps are decoded straight into GPU memory (Bitmap.Config.HARDWARE), and the
  * render thread only wakes for the crossfade, so the launcher idles at ~0% CPU.
+ * Photos come from Wallpapers: the weekly download, or the bundled set.
  */
 public final class WallpaperView extends SurfaceView implements SurfaceHolder.Callback {
 
-    public interface Listener { void onWallpaperShown(int index); }
+    public interface Listener { void onWallpaperShown(Wallpapers.Entry wallpaper); }
 
     static final long ROTATE_MS = 5 * 60 * 1000L;
     private static final long FADE_MS = 1800;
@@ -45,11 +44,14 @@ public final class WallpaperView extends SurfaceView implements SurfaceHolder.Ca
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG);
     private final RectF dst = new RectF();
-    private final List<String> files = new ArrayList<>();
     private final SharedPreferences prefs;
+    /** Render thread only (after the constructor). A new weekly set waits in pending. */
+    private List<Wallpapers.Entry> walls;
+    private List<Wallpapers.Entry> pending;
+    private long loadedAt;
 
     private Listener listener;
-    private boolean surfaceReady, running, transitioning, settle;
+    private boolean surfaceReady, running, transitioning, settle, previewStale;
     private int surfW, surfH;
     private Bitmap cur, next;
     /** Small software copy of the current photo, drawn instantly when Home comes back. */
@@ -64,20 +66,27 @@ public final class WallpaperView extends SurfaceView implements SurfaceHolder.Ca
         getHolder().addCallback(this);
         thread.start();
         render = new Handler(thread.getLooper());
-        try {
-            String[] list = ctx.getAssets().list("wallpapers");
-            if (list != null) {
-                Arrays.sort(list);
-                for (String f : list) if (f.endsWith(".jpg")) files.add(f);
-            }
-        } catch (IOException ignored) { }
-        index = Math.max(0, prefs.getInt("wall_index", 0)) % Math.max(1, files.size());
+        loadedAt = Wallpapers.fetchedAt(ctx);
+        walls = Wallpapers.load(ctx);
+        index = Math.max(0, prefs.getInt("wall_index", 0)) % Math.max(1, walls.size());
         nextChangeAt = prefs.getLong("wall_next_at_wall", 0);
     }
 
     public void setListener(Listener l) { listener = l; }
-    public int count() { return files.size(); }
-    public String file(int i) { return files.isEmpty() ? "" : files.get(i % files.size()); }
+    /**
+     * Picks up a new weekly set (call on start and when WallpaperFetcher reports one). It takes
+     * over at the next rotation, starting with its first photo, so the current one isn't cut short.
+     */
+    public void reloadIfChanged() {
+        long at = Wallpapers.fetchedAt(getContext());
+        if (at == loadedAt) return;
+        loadedAt = at;
+        final Context ctx = getContext().getApplicationContext();
+        render.post(() -> {
+            List<Wallpapers.Entry> l = Wallpapers.load(ctx);
+            if (!l.isEmpty()) pending = l;
+        });
+    }
 
     /** Render buffer size; pass the physical panel size for native 4K. */
     public void setBufferSize(int w, int h) { getHolder().setFixedSize(w, h); }
@@ -129,7 +138,13 @@ public final class WallpaperView extends SurfaceView implements SurfaceHolder.Ca
         synchronized (lock) { if (!surfaceReady || surfW == 0) return false; }
         cur = preview;
         drawFrame();
-        fadeTo(index, preview != null ? RESHARPEN_MS : FIRST_FADE_MS, false, false);
+        long fade = preview != null ? RESHARPEN_MS : FIRST_FADE_MS;
+        if (!fadeTo(index, fade, false, false) && pending != null) {
+            // The photo we were on is gone (two refreshes while Home was hidden): switch sets now.
+            walls = pending;
+            pending = null;
+            fadeTo(0, fade, true, false);
+        }
         return true;
     }
 
@@ -146,8 +161,17 @@ public final class WallpaperView extends SurfaceView implements SurfaceHolder.Ca
             if (transitioning) return;
             long now = System.currentTimeMillis();
             if (nextChangeAt == 0) scheduleNext(now);
-            if (now >= nextChangeAt && cur != null && surfaceReady && files.size() > 1) {
-                fadeTo((index + 1) % files.size(), FADE_MS, true, true);
+            if (now >= nextChangeAt && cur != null && surfaceReady && (walls.size() > 1 || pending != null)) {
+                int target = walls.isEmpty() ? 0 : (index + 1) % walls.size();
+                if (pending != null) {
+                    walls = pending;
+                    pending = null;
+                    target = 0;
+                }
+                if (!fadeTo(target, FADE_MS, true, true)) {
+                    index = target; // unreadable photo: skip it
+                    render.postDelayed(this, 10_000);
+                }
             } else {
                 render.postDelayed(this, Math.max(1000, nextChangeAt - now));
             }
@@ -159,11 +183,13 @@ public final class WallpaperView extends SurfaceView implements SurfaceHolder.Ca
         prefs.edit().putLong("wall_next_at_wall", nextChangeAt).apply();
     }
 
-    private void fadeTo(int newIndex, long duration, boolean advance, boolean settleZoom) {
-        if (files.isEmpty()) return;
-        Bitmap b = decode(files.get(newIndex), 0);
-        if (b == null) return;
+    private boolean fadeTo(int newIndex, long duration, boolean advance, boolean settleZoom) {
+        if (walls.isEmpty()) return false;
+        newIndex %= walls.size();
+        Bitmap b = decode(walls.get(newIndex), 0);
+        if (b == null) return false;
         boolean changed = advance || newIndex != index || preview == null;
+        previewStale |= changed;
         next = b;
         index = newIndex;
         transitioning = true;
@@ -172,10 +198,11 @@ public final class WallpaperView extends SurfaceView implements SurfaceHolder.Ca
         fadeStart = SystemClock.uptimeMillis();
         if (advance) prefs.edit().putInt("wall_index", index).apply();
         if (changed) {
-            final int shown = index;
+            final Wallpapers.Entry shown = walls.get(index);
             ui.post(() -> { if (listener != null) listener.onWallpaperShown(shown); });
         }
         render.post(frame);
+        return true;
     }
 
     private final Runnable frame = new Runnable() {
@@ -184,7 +211,8 @@ public final class WallpaperView extends SurfaceView implements SurfaceHolder.Ca
             if (fadeProgress() < 1f) {
                 render.postDelayed(this, 16);
             } else {
-                boolean newPhoto = settle || preview == null;
+                boolean newPhoto = previewStale;
+                previewStale = false;
                 if (cur != null && cur != preview) cur.recycle();
                 cur = next;
                 next = null;
@@ -192,7 +220,7 @@ public final class WallpaperView extends SurfaceView implements SurfaceHolder.Ca
                 drawFrame();
                 if (newPhoto) {
                     if (preview != null) preview.recycle();
-                    preview = decode(files.get(index), PREVIEW_SAMPLE);
+                    preview = decode(walls.get(index), PREVIEW_SAMPLE);
                     scheduleNext(System.currentTimeMillis());
                 }
                 render.removeCallbacks(tick);
@@ -208,7 +236,7 @@ public final class WallpaperView extends SurfaceView implements SurfaceHolder.Ca
     }
 
     /** sample == 0: full-quality GPU bitmap for the panel; otherwise a small software preview. */
-    private Bitmap decode(String name, int sample) {
+    private Bitmap decode(Wallpapers.Entry wall, int sample) {
         BitmapFactory.Options o = new BitmapFactory.Options();
         if (sample > 0) {
             o.inPreferredConfig = Bitmap.Config.ARGB_8888;
@@ -219,7 +247,7 @@ public final class WallpaperView extends SurfaceView implements SurfaceHolder.Ca
             synchronized (lock) { w = surfW; }
             o.inSampleSize = (w > 0 && w <= 1920) ? 2 : 1;
         }
-        try (InputStream in = getContext().getAssets().open("wallpapers/" + name)) {
+        try (InputStream in = Wallpapers.open(getContext(), wall.path)) {
             return BitmapFactory.decodeStream(in, null, o);
         } catch (IOException | RuntimeException e) {
             return null;

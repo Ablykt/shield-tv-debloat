@@ -2,7 +2,6 @@ package com.zen.home;
 
 import android.animation.ValueAnimator;
 import android.content.Context;
-import android.content.res.AssetManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
@@ -75,9 +74,9 @@ final class GlassView extends View {
         return fixedRadius > 0 ? fixedRadius : getHeight() / 2f;
     }
 
-    /** New wallpaper asset path (e.g. "wallpapers/03.jpg"); re-bakes the glass and crossfades. */
-    void setWallpaper(String assetPath, long fadeMs) {
-        wallpaper = assetPath;
+    /** New wallpaper (a Wallpapers.Entry path); re-bakes the glass and crossfades. */
+    void setWallpaper(String path, long fadeMs) {
+        wallpaper = path;
         pendingFade = fadeMs;
         bake();
     }
@@ -165,9 +164,9 @@ final class GlassView extends View {
         final int gen = ++bakeGen;
         final int tEnd = topScrimEnd, bStart = bottomScrimStart;
         final float tMax = topScrimMax, bMax = bottomScrimMax, r = radius();
-        final AssetManager assets = getContext().getAssets();
+        final Context app = getContext().getApplicationContext();
         BAKER.execute(() -> {
-            Bitmap out = render(assets, path, sx, sy, w, h, screenW, screenH, tEnd, tMax, bStart, bMax, r, density);
+            Bitmap out = render(app, path, sx, sy, w, h, screenW, screenH, tEnd, tMax, bStart, bMax, r, density);
             if (out == null) return;
             ui.post(() -> {
                 if (gen != bakeGen) { out.recycle(); return; }
@@ -197,12 +196,12 @@ final class GlassView extends View {
      * Uses a signed-distance field of the rounded rectangle to find each pixel's depth from
      * the rim and the rim's normal, then refracts the backdrop along that normal.
      */
-    static Bitmap render(AssetManager assets, String path, int px, int py, int w, int h,
+    static Bitmap render(Context ctx, String path, int px, int py, int w, int h,
                          int screenW, int screenH, int topEnd, float topMax,
                          int bottomStart, float bottomMax, float radius, float density) {
         int band = Math.max(8, Math.round(h * BAND));
         int sw = w + 2 * band, sh = h + 2 * band;
-        int[] src = backdrop(assets, path, px - band, py - band, sw, sh, screenW, screenH);
+        int[] src = backdrop(ctx, path, px - band, py - band, sw, sh, screenW, screenH);
         if (src == null) return null;
         for (int row = 0; row < sh; row++) {
             int screenY = py - band + row;
@@ -288,10 +287,10 @@ final class GlassView extends View {
      * being kept by the allocator (~55 MB) for the life of the process. The glass softens its
      * backdrop anyway, so the lower resolution doesn't show.
      */
-    private static int[] backdrop(AssetManager assets, String path, int x, int y, int w, int h,
+    private static int[] backdrop(Context ctx, String path, int x, int y, int w, int h,
                                   int screenW, int screenH) {
         Bitmap small;
-        try (InputStream in = assets.open(path)) {
+        try (InputStream in = Wallpapers.open(ctx, path)) {
             BitmapFactory.Options o = new BitmapFactory.Options();
             o.inSampleSize = 4;
             small = BitmapFactory.decodeStream(in, null, o);

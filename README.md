@@ -121,8 +121,14 @@ SHIELD TV models on the same software should work: packages a model doesn't have
 
 ## Zen Home
 
-- 12 public-domain/CC0 nature photos drawn at **native 4K** (the SHIELD renders UI at 1080p; the
-  wallpaper gets its own 4K surface), crossfading every 5 minutes with a location caption.
+- Nature photos drawn at **native 4K** (the SHIELD renders UI at 1080p; the wallpaper gets its
+  own 4K surface), crossfading every 5 minutes with a location and photographer caption.
+- **New photos every week.** Zen Home downloads 12 photos it hasn't shown before from Wikimedia
+  Commons' [featured natural places](https://commons.wikimedia.org/wiki/Commons:Featured_pictures/Places/Natural)
+  (about 2,300 reviewer-picked, freely licensed landscapes), cropped to 3840×2160. Wikimedia is
+  the only server it talks to; it sends no data about you. The download runs in a short-lived
+  helper process, so Home's memory doesn't change. The 12 photos built into the APK are shown
+  until the first download and whenever there's no internet.
 - Greeting, large clock and date; Search and Settings as Liquid Glass capsules.
 - Dock in an iOS 26-style **Liquid Glass** panel: clear glass whose rim refracts the wallpaper
   with slight chromatic fringing, plus a specular highlight that follows the focused app.
@@ -212,8 +218,9 @@ Wi-Fi name and screenshots) and `launcher/keystore/` (the release signing key).
 
 ## Wallpaper credits
 
-See [`launcher/app/assets/wallpapers/captions.txt`](launcher/app/assets/wallpapers/captions.txt).
-All images are CC0 or public domain, from Wikimedia Commons.
+Built-in photos: see [`launcher/app/assets/wallpapers/captions.txt`](launcher/app/assets/wallpapers/captions.txt).
+All are CC0 or public domain, from Wikimedia Commons. Weekly photos are credited on screen with
+their photographer and license.
 
 ## Disclaimer
 
