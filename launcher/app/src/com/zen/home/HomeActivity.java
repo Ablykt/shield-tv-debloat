@@ -1,0 +1,1013 @@
+package com.zen.home;
+
+import android.app.Activity;
+import android.app.ActivityOptions;
+import android.app.Dialog;
+import android.content.BroadcastReceiver;
+import android.content.ComponentCallbacks2;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.SharedPreferences;
+import android.graphics.Bitmap;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.Settings;
+import android.text.TextUtils;
+import android.util.DisplayMetrics;
+import android.util.TypedValue;
+import android.view.Display;
+import android.view.Gravity;
+import android.view.KeyEvent;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.ViewParent;
+import android.view.animation.DecelerateInterpolator;
+import android.widget.FrameLayout;
+import android.widget.ImageView;
+import android.widget.LinearLayout;
+import android.widget.TextClock;
+import android.widget.TextView;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public final class HomeActivity extends Activity implements WallpaperView.Listener {
+
+    private static final String[] DEFAULT_DOCK = {
+            "com.netflix.ninja",
+            "com.google.android.youtube.tv",
+            "com.disney.disneyplus",
+            "com.wbd.stream",
+            "com.amazon.amazonvideo.livingroom",
+            "com.hulu.livingroomplus",
+            "com.peacocktv.peacockandroid",
+            "com.plexapp.android",
+    };
+    private static final int COLUMNS = 6;
+
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private final ExecutorService io = Executors.newSingleThreadExecutor();
+    private final DecelerateInterpolator ease = new DecelerateInterpolator(2f);
+
+    private float density;
+    private int screenW, screenH, tileW, tileH, gap, side;
+    private int dockW, dockH, dockSlotW, dockSlotH, dockGap, dockPadX, dockPadY, dockViewportW;
+    private SharedPreferences prefs;
+
+    private WallpaperView wall;
+    private View dim;
+    private TallLayout content;
+    private static final int GLASS_RADIUS = 30;
+    private static final int TOP_SCRIM = 0x8C000000, TOP_SCRIM_DP = 210;
+    private static final int BOTTOM_SCRIM = 0x80000000, BOTTOM_SCRIM_DP = 220;
+    private GlassView glass;
+    /** Every glass element on screen (dock + pills); all re-bake when the wallpaper changes. */
+    private final List<GlassView> glasses = new ArrayList<>();
+    private View dockPanel;
+    private WideLayout dockRow;
+    private LinearLayout grid;
+    private TextView captionTitle, captionCredit, dockEmpty, dockName, greeting, moveHint;
+    private final List<String[]> captions = new ArrayList<>();
+
+    private final Map<String, AppRepo.App> apps = new LinkedHashMap<>();
+    private final List<String> dock = new ArrayList<>();
+    private final List<String> gridOrder = new ArrayList<>();
+    private final Set<String> hidden = new HashSet<>();
+    private boolean showHidden;
+    private AppTile moving;
+    private Dialog menu;
+    private boolean okHeld, glassReady, menuArmed;
+    private Sounds sounds;
+    private float dockTargetX;
+
+    private boolean started, tilesStale;
+
+    private final BroadcastReceiver packagesChanged = new BroadcastReceiver() {
+        @Override public void onReceive(Context c, Intent i) {
+            tilesStale = true;
+            main.removeCallbacks(refresh);
+            if (started) main.postDelayed(refresh, 600);
+        }
+    };
+    private final Runnable refresh = this::refreshTiles;
+
+    private final BroadcastReceiver tilesReady = new BroadcastReceiver() {
+        @Override public void onReceive(Context c, Intent i) {
+            readCachedTiles();
+        }
+    };
+
+    // ------------------------------------------------------------------ lifecycle
+
+    @Override protected void onCreate(Bundle state) {
+        super.onCreate(state);
+        prefs = getSharedPreferences("zen", MODE_PRIVATE);
+        sounds = new Sounds(this);
+        DisplayMetrics m = getResources().getDisplayMetrics();
+        density = m.density;
+        screenW = m.widthPixels;
+        screenH = m.heightPixels;
+        tileW = dp(130);
+        tileH = Math.round(tileW * 9f / 16f);
+        gap = dp(18);
+        side = Math.max(dp(32), (screenW - (COLUMNS * tileW + (COLUMNS - 1) * gap)) / 2);
+        dockGap = dp(14);
+        // Room inside the glass so an enlarged end tile never reaches the panel's rounded corners.
+        dockPadX = dp(22);
+        dockPadY = dp(14);
+        dockViewportW = screenW - 2 * side - 2 * dockPadX;
+        sizeDock(DEFAULT_DOCK.length);
+        loadCaptions();
+        hidden.addAll(split(prefs.getString("hidden", "")));
+
+        FrameLayout root = new FrameLayout(this);
+        root.setBackgroundColor(0xFF000000);
+
+        wall = new WallpaperView(this, prefs);
+        Display.Mode mode = getWindowManager().getDefaultDisplay().getMode();
+        int pw = Math.min(3840, mode.getPhysicalWidth()), ph = Math.min(2160, mode.getPhysicalHeight());
+        wall.setBufferSize(pw, ph);
+        wall.setListener(this);
+        root.addView(wall, new FrameLayout.LayoutParams(-1, -1));
+
+        root.addView(gradient(TOP_SCRIM, 0x00000000, GradientDrawable.Orientation.TOP_BOTTOM),
+                new FrameLayout.LayoutParams(-1, dp(TOP_SCRIM_DP), Gravity.TOP));
+        root.addView(gradient(0x00000000, BOTTOM_SCRIM, GradientDrawable.Orientation.TOP_BOTTOM),
+                new FrameLayout.LayoutParams(-1, dp(BOTTOM_SCRIM_DP), Gravity.BOTTOM));
+        dim = new View(this);
+        dim.setBackgroundColor(0xFF000000);
+        dim.setAlpha(0f);
+        root.addView(dim, new FrameLayout.LayoutParams(-1, -1));
+
+        content = new TallLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setClipChildren(false);
+        content.setClipToPadding(false);
+        root.addView(content, new FrameLayout.LayoutParams(-1, -2));
+        buildChrome();
+
+        moveHint = text("◀ ▶  move    ·    OK  done", 12, 0xFFFFFFFF, "sans-serif-medium");
+        moveHint.setPadding(dp(18), dp(8), dp(18), dp(8));
+        moveHint.setBackground(round(0xCC1C1C1E, dp(18)));
+        moveHint.setVisibility(View.GONE);
+        FrameLayout.LayoutParams hl = new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        hl.bottomMargin = dp(28);
+        root.addView(moveHint, hl);
+
+        setContentView(root);
+        // Zen Home plays its own Apple TV-style sounds; mute Android's default focus clicks.
+        getWindow().getDecorView().setSoundEffectsEnabled(false);
+        root.getViewTreeObserver().addOnGlobalFocusChangeListener((oldF, newF) -> onFocusMoved(newF));
+
+        IntentFilter f = new IntentFilter();
+        f.addAction(Intent.ACTION_PACKAGE_ADDED);
+        f.addAction(Intent.ACTION_PACKAGE_REMOVED);
+        f.addAction(Intent.ACTION_PACKAGE_CHANGED);
+        f.addAction(Intent.ACTION_PACKAGE_REPLACED);
+        f.addDataScheme("package");
+        registerReceiver(packagesChanged, f);
+
+        registerReceiver(tilesReady, new IntentFilter(TileLoaderService.ACTION_READY));
+
+        loadApps();
+    }
+
+    @Override protected void onStart() {
+        super.onStart();
+        started = true;
+        wall.start();
+        sounds.wake();
+        greetingTick.run();
+        if (tilesStale) refreshTiles();
+    }
+
+    @Override protected void onStop() {
+        started = false;
+        main.removeCallbacks(greetingTick);
+        sounds.sleep();
+        wall.stop();
+        super.onStop();
+    }
+
+    private final Runnable greetingTick = new Runnable() {
+        @Override public void run() {
+            int h = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY);
+            greeting.setText(h < 5 ? "Good night" : h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening");
+            main.postDelayed(this, 60_000);
+        }
+    };
+
+    @Override protected void onDestroy() {
+        unregisterReceiver(packagesChanged);
+        unregisterReceiver(tilesReady);
+        io.shutdownNow();
+        sounds.release();
+        super.onDestroy();
+    }
+
+    @Override public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND) wall.releaseIfHidden();
+    }
+
+    /** Home pressed while already home: back to the dock, like Apple TV. */
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        resetToDock();
+    }
+
+    @Override public void onBackPressed() {
+        resetToDock();
+    }
+
+    // ------------------------------------------------------------------ layout
+
+    private void buildChrome() {
+        // Header: greeting, big clock and date on the left; Search / Settings pills on the right.
+        FrameLayout header = new FrameLayout(this);
+        header.setClipChildren(false);
+        // The pills sit on the padding edge; let a focused (enlarged) pill draw past it.
+        header.setClipToPadding(false);
+        header.setPadding(side, dp(30), side, 0);
+
+        LinearLayout clock = new LinearLayout(this);
+        clock.setOrientation(LinearLayout.VERTICAL);
+        greeting = text("", 9.5f, 0xD9FFFFFF, "sans-serif-medium");
+        caps(greeting, 0.2f);
+        TextClock time = new TextClock(this);
+        time.setFormat12Hour("h:mm");
+        time.setFormat24Hour("HH:mm");
+        style(time, 64, 0xFFFFFFFF, "sans-serif-thin");
+        TextClock date = new TextClock(this);
+        date.setFormat12Hour("EEEE d MMMM");
+        date.setFormat24Hour("EEEE d MMMM");
+        style(date, 9.5f, 0xD9FFFFFF, "sans-serif-medium");
+        caps(date, 0.15f);
+        for (TextView t : new TextView[] { greeting, time, date }) t.setShadowLayer(dp(6), 0, dp(1), 0x66000000);
+        clock.addView(greeting);
+        LinearLayout.LayoutParams tl = new LinearLayout.LayoutParams(-2, -2);
+        tl.topMargin = dp(2);
+        clock.addView(time, tl);
+        LinearLayout.LayoutParams dl = new LinearLayout.LayoutParams(-2, -2);
+        dl.topMargin = dp(4);
+        clock.addView(date, dl);
+        header.addView(clock, new FrameLayout.LayoutParams(-2, -2, Gravity.START | Gravity.TOP));
+
+        LinearLayout pills = new LinearLayout(this);
+        pills.setOrientation(LinearLayout.HORIZONTAL);
+        pills.setClipChildren(false);
+        pills.addView(pill(R.drawable.ic_search, "Search", v -> openSearch()));
+        View s = pill(R.drawable.ic_settings, "Settings", v -> safeStart(new Intent(Settings.ACTION_SETTINGS)));
+        ((LinearLayout.LayoutParams) s.getLayoutParams()).leftMargin = dp(10);
+        pills.addView(s);
+        header.addView(pills, new FrameLayout.LayoutParams(-2, -2, Gravity.END | Gravity.TOP));
+        int headerH = dp(150);
+        content.addView(header, new LinearLayout.LayoutParams(-1, headerH));
+
+        // Stage: the rest of the first screen. The dock is anchored to its bottom edge with the
+        // focused app's name above it, the wallpaper caption opposite, Apple TV style.
+        FrameLayout stage = new FrameLayout(this);
+        stage.setClipChildren(false);
+        LinearLayout bottom = new LinearLayout(this);
+        bottom.setOrientation(LinearLayout.VERTICAL);
+        bottom.setClipChildren(false);
+
+        FrameLayout nameRow = new FrameLayout(this);
+        dockName = text("", 22, 0xFFFFFFFF, "sans-serif-medium");
+        dockName.setShadowLayer(dp(8), 0, dp(1), 0x80000000);
+        nameRow.addView(dockName, new FrameLayout.LayoutParams(-2, -2, Gravity.START | Gravity.BOTTOM));
+        LinearLayout caption = new LinearLayout(this);
+        caption.setOrientation(LinearLayout.VERTICAL);
+        caption.setGravity(Gravity.END);
+        captionTitle = text("", 10.5f, 0xE6FFFFFF, "sans-serif-medium");
+        captionCredit = text("", 8.5f, 0x99FFFFFF, "sans-serif");
+        captionTitle.setShadowLayer(dp(4), 0, dp(1), 0x99000000);
+        captionCredit.setShadowLayer(dp(4), 0, dp(1), 0x99000000);
+        captionTitle.setSingleLine(true);
+        captionCredit.setSingleLine(true);
+        caption.addView(captionTitle, new LinearLayout.LayoutParams(-2, -2));
+        LinearLayout.LayoutParams cc = new LinearLayout.LayoutParams(-2, -2);
+        cc.topMargin = dp(2);
+        caption.addView(captionCredit, cc);
+        nameRow.addView(caption, new FrameLayout.LayoutParams(-2, -2, Gravity.END | Gravity.BOTTOM));
+        LinearLayout.LayoutParams nl = new LinearLayout.LayoutParams(-1, -2);
+        nl.leftMargin = side + dp(4);
+        nl.rightMargin = side + dp(4);
+        nl.bottomMargin = dp(12);
+        bottom.addView(nameRow, nl);
+
+        FrameLayout panel = new FrameLayout(this);
+        glass = newGlass(dp(GLASS_RADIUS), 0);
+        panel.addView(glass, new FrameLayout.LayoutParams(-1, -1));
+        FrameLayout viewport = new FrameLayout(this);
+        viewport.setClipChildren(false);
+        dockRow = new WideLayout(this);
+        dockRow.setOrientation(LinearLayout.HORIZONTAL);
+        dockRow.setClipChildren(false);
+        viewport.addView(dockRow, new FrameLayout.LayoutParams(-2, -2));
+        FrameLayout.LayoutParams vp = new FrameLayout.LayoutParams(-1, -2);
+        vp.setMargins(dockPadX, dockPadY, dockPadX, dockPadY);
+        panel.addView(viewport, vp);
+        dockEmpty = text("Your Dock is empty. Press ▼ and hold OK on any app to add it.",
+                12, 0xCCFFFFFF, "sans-serif-medium");
+        dockEmpty.setGravity(Gravity.CENTER);
+        dockEmpty.setVisibility(View.GONE);
+        panel.addView(dockEmpty, new FrameLayout.LayoutParams(-1, -1));
+        // Clip the row to the glass (rounded) so a long dock scrolls inside it.
+        panel.setOutlineProvider(new android.view.ViewOutlineProvider() {
+            @Override public void getOutline(View v, android.graphics.Outline o) {
+                o.setRoundRect(0, 0, v.getWidth(), v.getHeight(), dp(GLASS_RADIUS));
+            }
+        });
+        panel.setClipToOutline(true);
+        // The outline above frames the dock; don't also trim the row to its rectangle, or an
+        // enlarged end tile loses its rounded outer corners.
+        panel.setClipChildren(false);
+        LinearLayout.LayoutParams pl = new LinearLayout.LayoutParams(-1, dockSlotH + 2 * dockPadY);
+        pl.leftMargin = side;
+        pl.rightMargin = side;
+        bottom.addView(panel, pl);
+        dockPanel = panel;
+
+        TextView more = text("▾  All apps", 9, 0x8CFFFFFF, "sans-serif-medium");
+        caps(more, 0.12f);
+        LinearLayout.LayoutParams ml = new LinearLayout.LayoutParams(-2, -2);
+        ml.gravity = Gravity.CENTER_HORIZONTAL;
+        ml.topMargin = dp(10);
+        ml.bottomMargin = dp(12);
+        bottom.addView(more, ml);
+
+        stage.addView(bottom, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
+        content.addView(stage, new LinearLayout.LayoutParams(-1, screenH - headerH));
+
+        TextView appsLabel = text("Apps", 12.5f, 0xB3FFFFFF, "sans-serif-medium");
+        LinearLayout.LayoutParams al = new LinearLayout.LayoutParams(-2, -2);
+        al.leftMargin = side;
+        al.topMargin = dp(24);
+        content.addView(appsLabel, al);
+
+        grid = new LinearLayout(this);
+        grid.setOrientation(LinearLayout.VERTICAL);
+        grid.setClipChildren(false);
+        LinearLayout.LayoutParams gl = new LinearLayout.LayoutParams(-1, -2);
+        gl.leftMargin = side;
+        gl.topMargin = dp(12);
+        content.addView(grid, gl);
+
+        TextView help = text("Hold OK (or press ☰) on any app to move it, add it to the Dock, or hide it.",
+                10.5f, 0x80FFFFFF, "sans-serif");
+        LinearLayout.LayoutParams hp = new LinearLayout.LayoutParams(-2, -2);
+        hp.leftMargin = side;
+        hp.topMargin = dp(10);
+        hp.bottomMargin = dp(48);
+        content.addView(help, hp);
+    }
+
+    /** Dock tiles grow to fill the glass panel, up to Apple-ish size; past ~7 apps the row scrolls. */
+    private void sizeDock(int count) {
+        int n = Math.max(1, count);
+        int ring = 2 * AppTile.slotGap(density);
+        int w = (dockViewportW - (n - 1) * dockGap) / n - ring;
+        dockW = Math.max(dp(92), Math.min(dp(150), w));
+        dockH = Math.round(dockW * 9f / 16f);
+        dockSlotW = dockW + ring;
+        dockSlotH = dockH + ring;
+    }
+
+    private void rebuild(String focusPkg, Boolean focusInDock) {
+        List<AppRepo.App> docked = new ArrayList<>();
+        for (String pkg : dock) if (apps.containsKey(pkg)) docked.add(apps.get(pkg));
+        sizeDock(docked.size());
+        dockRow.removeAllViews();
+        for (AppRepo.App a : docked) {
+            AppTile t = tile(a, true);
+            t.setId(View.generateViewId());
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2);
+            if (dockRow.getChildCount() > 0) lp.leftMargin = dockGap;
+            dockRow.addView(t, lp);
+        }
+        // Like Apple TV, the dock's ends are a stop: ◀ / ▶ never jump into the grid.
+        if (dockRow.getChildCount() > 0) {
+            View first = dockRow.getChildAt(0), last = dockRow.getChildAt(dockRow.getChildCount() - 1);
+            first.setNextFocusLeftId(first.getId());
+            last.setNextFocusRightId(last.getId());
+        }
+        ViewGroup.LayoutParams pl = dockPanel.getLayoutParams();
+        pl.height = dockSlotH + 2 * dockPadY;
+        dockPanel.setLayoutParams(pl);
+        dockEmpty.setVisibility(docked.isEmpty() ? View.VISIBLE : View.GONE);
+        if (docked.isEmpty()) dockName.setText("");
+
+        grid.removeAllViews();
+        List<View> cells = new ArrayList<>();
+        for (String pkg : visibleGrid()) {
+            AppTile t = tile(apps.get(pkg), false);
+            if (hidden.contains(pkg)) t.setAlpha(0.45f);
+            cells.add(t);
+        }
+        if (!hidden.isEmpty()) cells.add(hiddenToggle());
+        LinearLayout row = null;
+        for (int i = 0; i < cells.size(); i++) {
+            if (i % COLUMNS == 0) {
+                row = new LinearLayout(this);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                row.setClipChildren(false);
+                LinearLayout.LayoutParams rl = new LinearLayout.LayoutParams(-2, -2);
+                if (grid.getChildCount() > 0) rl.topMargin = dp(10);
+                grid.addView(row, rl);
+            }
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2);
+            if (i % COLUMNS != 0) lp.leftMargin = gap;
+            row.addView(cells.get(i), lp);
+        }
+
+        View target = focusPkg != null ? findTile(focusPkg, focusInDock) : null;
+        if (target == null && getCurrentFocus() == null) target = firstDockTileOrGrid();
+        if (target != null) target.requestFocus();
+    }
+
+    private AppTile tile(AppRepo.App a, boolean inDock) {
+        AppTile t = new AppTile(this, a, inDock, inDock ? dockW : tileW, inDock ? dockH : tileH, density);
+        t.setSoundEffectsEnabled(false);
+        t.setOnClickListener(v -> { if (moving == null) { sounds.select(); launch(a, t); } });
+        return t;
+    }
+
+    private View hiddenToggle() {
+        TextView v = text(showHidden ? "Done" : "Hidden (" + hidden.size() + ")", 12, 0xFFFFFFFF, "sans-serif-medium");
+        v.setGravity(Gravity.CENTER);
+        v.setFocusable(true);
+        v.setBackground(round(0x33FFFFFF, dp(9)));
+        v.setLayoutParams(new LinearLayout.LayoutParams(tileW, tileH));
+        v.setOnFocusChangeListener((x, f) -> {
+            v.setBackground(round(f ? 0xFFFFFFFF : 0x33FFFFFF, dp(9)));
+            v.setTextColor(f ? 0xFF000000 : 0xFFFFFFFF);
+            v.animate().scaleX(f ? 1.08f : 1f).scaleY(f ? 1.08f : 1f).setDuration(150).start();
+        });
+        v.setSoundEffectsEnabled(false);
+        v.setOnClickListener(x -> {
+            sounds.select();
+            showHidden = !showHidden;
+            rebuild(null, null);
+            View t = grid.getChildCount() > 0 ? lastCell() : null;
+            if (t != null) t.requestFocus();
+        });
+        return v;
+    }
+
+    // ------------------------------------------------------------------ data
+
+    /** Show cached tiles immediately, then have the :tiles process re-render them. */
+    private void loadApps() {
+        readCachedTiles();
+        refreshTiles();
+    }
+
+    private void readCachedTiles() {
+        io.execute(() -> {
+            List<AppRepo.App> list = TileCache.read(getApplicationContext());
+            if (!list.isEmpty()) main.post(() -> applyApps(list));
+        });
+    }
+
+    private void refreshTiles() {
+        try {
+            startService(new Intent(this, TileLoaderService.class)
+                    .putExtra(TileLoaderService.EXTRA_W, Math.round(tileW * AppTile.FOCUS_SCALE))
+                    .putExtra(TileLoaderService.EXTRA_H, Math.round(tileH * AppTile.FOCUS_SCALE)));
+            tilesStale = false;
+        } catch (RuntimeException e) {
+            tilesStale = true; // background-start restriction; retried in onStart()
+        }
+    }
+
+    private void applyApps(List<AppRepo.App> list) {
+        View f = getCurrentFocus();
+        String focusPkg = f instanceof AppTile ? ((AppTile) f).pkg : null;
+        Boolean focusDock = f instanceof AppTile ? ((AppTile) f).inDock : null;
+        boolean firstLoad = apps.isEmpty();
+
+        apps.clear();
+        for (AppRepo.App a : list) apps.put(a.pkg, a);
+
+        dock.clear();
+        if (prefs.contains("dock")) {
+            dock.addAll(split(prefs.getString("dock", "")));
+        } else {
+            for (String p : DEFAULT_DOCK) if (apps.containsKey(p)) dock.add(p);
+            save();
+        }
+        gridOrder.clear();
+        gridOrder.addAll(split(prefs.getString("grid", "")));
+        for (String p : apps.keySet()) if (!gridOrder.contains(p)) gridOrder.add(p);
+
+        if (moving != null) endMove();
+        rebuild(focusPkg, focusDock);
+        if (firstLoad) {
+            View first = firstDockTileOrGrid();
+            if (first != null) first.requestFocus();
+        }
+    }
+
+    private List<String> visibleGrid() {
+        List<String> out = new ArrayList<>();
+        for (String p : gridOrder) {
+            if (!apps.containsKey(p) || dock.contains(p)) continue;
+            if (hidden.contains(p) && !showHidden) continue;
+            out.add(p);
+        }
+        return out;
+    }
+
+    private void save() {
+        prefs.edit()
+                .putString("dock", TextUtils.join(",", dock))
+                .putString("grid", TextUtils.join(",", gridOrder))
+                .putString("hidden", TextUtils.join(",", hidden))
+                .apply();
+    }
+
+    private static List<String> split(String s) {
+        List<String> out = new ArrayList<>();
+        if (s == null || s.isEmpty()) return out;
+        out.addAll(Arrays.asList(s.split(",")));
+        return out;
+    }
+
+    private void loadCaptions() {
+        try (BufferedReader r = new BufferedReader(new InputStreamReader(
+                getAssets().open("wallpapers/captions.txt"), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                String[] p = line.split("\\|", 2);
+                captions.add(new String[] { p[0], p.length > 1 ? p[1] : "" });
+            }
+        } catch (Exception ignored) { }
+    }
+
+    @Override public void onWallpaperShown(int index) {
+        for (GlassView g : glasses) g.setWallpaper("wallpapers/" + wall.file(index), glassReady ? 1800 : 0);
+        glassReady = true;
+        final String[] c = index < captions.size() ? captions.get(index) : new String[] { "", "" };
+        captionTitle.animate().alpha(0f).setDuration(400).withEndAction(() -> {
+            captionTitle.setText(c[0]);
+            captionCredit.setText(c[1]);
+            captionTitle.animate().alpha(1f).setDuration(900).start();
+            captionCredit.setAlpha(0f);
+            captionCredit.animate().alpha(1f).setDuration(900).start();
+        }).start();
+        captionCredit.animate().alpha(0f).setDuration(400).start();
+    }
+
+    // ------------------------------------------------------------------ focus & scrolling
+
+    private void onFocusMoved(View v) {
+        if (v == null) return;
+        if (v instanceof AppTile && ((AppTile) v).inDock) {
+            scrollContentTo(0, 0f);
+            keepInDockView(v);
+            showDockName(((AppTile) v).name);
+            // Light on the glass rim follows the focused app (where it will be after scrolling).
+            glass.setLight(dockPadX + dockTargetX + v.getLeft() + v.getWidth() / 2f);
+        } else if (isInside(v, grid)) {
+            int top = relativeTop(v, content);
+            int target = -(top - Math.round(screenH * 0.30f));
+            int min = -Math.max(0, content.getHeight() - screenH);
+            scrollContentTo(Math.max(min, Math.min(0, target)), 0.62f);
+        } else {
+            scrollContentTo(0, 0f);
+        }
+    }
+
+    private void scrollContentTo(int y, float dimAlpha) {
+        if (content.getTranslationY() != y) {
+            content.animate().translationY(y).setDuration(320).setInterpolator(ease).start();
+        }
+        dim.animate().alpha(dimAlpha).setDuration(320).start();
+        glass.setClarity(dimAlpha > 0f ? 0f : 1f);
+    }
+
+    private void showDockName(String name) {
+        if (name.contentEquals(dockName.getText())) return;
+        dockName.animate().cancel();
+        dockName.setAlpha(0.25f);
+        dockName.setText(name);
+        dockName.animate().alpha(1f).setDuration(220).start();
+    }
+
+    /** Scrolls a long dock inside the glass panel so the focused tile stays visible. */
+    private void keepInDockView(View tile) {
+        float tx = dockTargetX;
+        int left = tile.getLeft();
+        float target = tx;
+        if (left + tx < 0) target = -left;
+        else if (left + dockSlotW + tx > dockViewportW) target = dockViewportW - dockSlotW - left;
+        dockTargetX = target;
+        if (target != tx) dockRow.animate().translationX(target).setDuration(260).setInterpolator(ease).start();
+    }
+
+    private void resetToDock() {
+        if (menu != null && menu.isShowing()) menu.dismiss();
+        if (moving != null) endMove();
+        View first = firstDockTileOrGrid();
+        dockTargetX = 0;
+        dockRow.animate().translationX(0).setDuration(260).setInterpolator(ease).start();
+        if (first != null) first.requestFocus();
+        scrollContentTo(0, 0f);
+    }
+
+    private View firstDockTileOrGrid() {
+        if (dockRow.getChildCount() > 0) return dockRow.getChildAt(0);
+        if (grid.getChildCount() > 0) return ((ViewGroup) grid.getChildAt(0)).getChildAt(0);
+        return null;
+    }
+
+    private View lastCell() {
+        ViewGroup row = (ViewGroup) grid.getChildAt(grid.getChildCount() - 1);
+        return row.getChildAt(row.getChildCount() - 1);
+    }
+
+    private AppTile findTile(String pkg, Boolean inDock) {
+        if (inDock == null || inDock) {
+            for (int i = 0; i < dockRow.getChildCount(); i++) {
+                View c = dockRow.getChildAt(i);
+                if (c instanceof AppTile && ((AppTile) c).pkg.equals(pkg)) return (AppTile) c;
+            }
+        }
+        if (inDock == null || !inDock) {
+            for (int r = 0; r < grid.getChildCount(); r++) {
+                ViewGroup row = (ViewGroup) grid.getChildAt(r);
+                for (int i = 0; i < row.getChildCount(); i++) {
+                    View c = row.getChildAt(i);
+                    if (c instanceof AppTile && ((AppTile) c).pkg.equals(pkg)) return (AppTile) c;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static boolean isInside(View v, View ancestor) {
+        for (ViewParent p = v.getParent(); p != null; p = p.getParent()) if (p == ancestor) return true;
+        return false;
+    }
+
+    private static int relativeTop(View v, View ancestor) {
+        int top = 0;
+        for (View c = v; c != null && c != ancestor; c = (View) c.getParent()) top += c.getTop();
+        return top;
+    }
+
+    // ------------------------------------------------------------------ editing
+
+    private void showMenu(AppTile t) {
+        AppRepo.App a = apps.get(t.pkg);
+        if (a == null || (menu != null && menu.isShowing())) return;
+        menu = new Dialog(this, R.style.ZenDialog);
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(14), dp(16), dp(14), dp(14));
+        box.setBackground(round(0xF21C1C1E, dp(18)));
+        TextView title = text(a.label, 15, 0xFFFFFFFF, "sans-serif-medium");
+        title.setPadding(dp(10), 0, dp(10), dp(10));
+        box.addView(title);
+
+        boolean canMove = t.inDock ? dock.size() > 1 : visibleGrid().size() > 1;
+        if (canMove) box.addView(menuItem("Move", () -> startMove(t)));
+        if (t.inDock) {
+            box.addView(menuItem("Remove from Dock", () -> {
+                dock.remove(t.pkg);
+                save();
+                rebuild(t.pkg, false);
+            }));
+        } else {
+            box.addView(menuItem("Add to Dock", () -> {
+                dock.add(t.pkg);
+                hidden.remove(t.pkg);
+                save();
+                rebuild(t.pkg, true);
+            }));
+            boolean isHidden = hidden.contains(t.pkg);
+            box.addView(menuItem(isHidden ? "Unhide" : "Hide from Home", () -> {
+                if (isHidden) hidden.remove(t.pkg); else hidden.add(t.pkg);
+                save();
+                rebuild(isHidden ? t.pkg : null, false);
+                if (!isHidden && getCurrentFocus() == null) {
+                    View f = firstDockTileOrGrid();
+                    if (f != null) f.requestFocus();
+                }
+            }));
+        }
+        box.addView(menuItem("App info", () -> safeStart(new Intent(
+                Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", t.pkg, null)))));
+        box.addView(menuItem("Cancel", () -> { }));
+        menu.setContentView(box, new ViewGroup.LayoutParams(dp(250), -2));
+        menuArmed = false;
+        menu.show();
+        menu.getWindow().getDecorView().setSoundEffectsEnabled(false);
+        sounds.select();
+        main.post(() -> menuArmed = true); // the first item's initial focus shouldn't tick
+    }
+
+    private View menuItem(String label, Runnable action) {
+        TextView v = text(label, 13, 0xFFFFFFFF, "sans-serif-medium");
+        v.setPadding(dp(14), 0, dp(14), 0);
+        v.setGravity(Gravity.CENTER_VERTICAL);
+        v.setFocusable(true);
+        v.setBackground(round(0x00000000, dp(10)));
+        v.setOnFocusChangeListener((x, f) -> {
+            v.setBackground(round(f ? 0xFFFFFFFF : 0x00000000, dp(10)));
+            v.setTextColor(f ? 0xFF000000 : 0xFFFFFFFF);
+            if (f && menuArmed) sounds.tick();
+        });
+        v.setSoundEffectsEnabled(false);
+        v.setOnClickListener(x -> {
+            sounds.select();
+            if (menu != null) menu.dismiss();
+            action.run();
+        });
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, dp(38));
+        lp.topMargin = dp(4);
+        v.setLayoutParams(lp);
+        return v;
+    }
+
+    private void startMove(AppTile t) {
+        moving = t;
+        t.requestFocus();
+        t.setWiggling(true);
+        moveHint.setText(t.inDock ? "◀ ▶  move    ·    OK  done" : "◀ ▶ ▲ ▼  move    ·    OK  done");
+        moveHint.setVisibility(View.VISIBLE);
+    }
+
+    private void endMove() {
+        if (moving != null) moving.setWiggling(false);
+        moving = null;
+        moveHint.setVisibility(View.GONE);
+        save();
+    }
+
+    private void shift(int delta) {
+        String pkg = moving.pkg;
+        boolean inDock = moving.inDock;
+        if (inDock) {
+            int i = dock.indexOf(pkg);
+            int j = Math.max(0, Math.min(dock.size() - 1, i + delta));
+            if (i == j) { sounds.bump(); return; }
+            dock.remove(i);
+            dock.add(j, pkg);
+        } else {
+            List<String> vis = visibleGrid();
+            int i = vis.indexOf(pkg);
+            int j = Math.max(0, Math.min(vis.size() - 1, i + delta));
+            if (i == j) { sounds.bump(); return; }
+            String anchor = vis.get(j);
+            gridOrder.remove(pkg);
+            int at = gridOrder.indexOf(anchor) + (j > i ? 1 : 0);
+            gridOrder.add(at, pkg);
+        }
+        sounds.tick();
+        moving.setWiggling(false);
+        rebuild(pkg, inDock);
+        AppTile t = findTile(pkg, inDock);
+        moving = t;
+        if (t != null) t.setWiggling(true);
+    }
+
+    @Override public boolean dispatchKeyEvent(KeyEvent e) {
+        if (moving != null && isMoveKey(e.getKeyCode())) {
+            if (e.getAction() != KeyEvent.ACTION_DOWN) return true;
+            switch (e.getKeyCode()) {
+                case KeyEvent.KEYCODE_DPAD_LEFT: shift(-1); break;
+                case KeyEvent.KEYCODE_DPAD_RIGHT: shift(1); break;
+                case KeyEvent.KEYCODE_DPAD_UP: if (!moving.inDock) shift(-COLUMNS); break;
+                case KeyEvent.KEYCODE_DPAD_DOWN: if (!moving.inDock) shift(COLUMNS); break;
+                default:
+                    if (e.getRepeatCount() == 0) {
+                        AppTile t = moving;
+                        endMove();
+                        t.requestFocus();
+                    }
+            }
+            return true;
+        }
+        // On TV the launcher owns the SEARCH key (keyboards, phone remotes); the
+        // Shield remote's mic sends ASSIST, which the system routes to Assistant itself.
+        if (e.getKeyCode() == KeyEvent.KEYCODE_SEARCH) {
+            if (e.getAction() == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0) openSearch();
+            return true;
+        }
+        if (e.getAction() == KeyEvent.ACTION_DOWN) {
+            // Lets the next focused tile tilt in from the side the remote moved toward.
+            AppTile.pendingTilt = e.getKeyCode() == KeyEvent.KEYCODE_DPAD_RIGHT ? 1
+                    : e.getKeyCode() == KeyEvent.KEYCODE_DPAD_LEFT ? -1 : 0;
+        }
+        View focus = getCurrentFocus();
+        if (e.getAction() == KeyEvent.ACTION_DOWN && e.getKeyCode() == KeyEvent.KEYCODE_MENU
+                && focus instanceof AppTile) {
+            showMenu((AppTile) focus);
+            return true;
+        }
+        // Holding OK opens the app menu. Driven by key repeats rather than View's
+        // long-click timer so the held key's ACTION_UP never also launches the app.
+        int code = e.getKeyCode();
+        if ((code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER) && focus instanceof AppTile) {
+            if (e.getAction() == KeyEvent.ACTION_DOWN) {
+                if (e.getRepeatCount() == 0 && !e.isLongPress()) {
+                    okHeld = false;
+                } else {
+                    if (!okHeld) {
+                        okHeld = true;
+                        showMenu((AppTile) focus);
+                    }
+                    return true;
+                }
+            } else if (e.getAction() == KeyEvent.ACTION_UP && okHeld) {
+                okHeld = false;
+                return true;
+            }
+        }
+        // Navigation sounds: tick when focus actually moves, bump when an arrow goes nowhere.
+        boolean arrow = e.getAction() == KeyEvent.ACTION_DOWN && isArrow(code);
+        View before = getCurrentFocus();
+        boolean handled = super.dispatchKeyEvent(e);
+        if (arrow) {
+            if (getCurrentFocus() != before) sounds.tick();
+            else if (e.getRepeatCount() == 0) sounds.bump();
+        }
+        return handled;
+    }
+
+    private static boolean isArrow(int code) {
+        return code == KeyEvent.KEYCODE_DPAD_LEFT || code == KeyEvent.KEYCODE_DPAD_RIGHT
+                || code == KeyEvent.KEYCODE_DPAD_UP || code == KeyEvent.KEYCODE_DPAD_DOWN;
+    }
+
+    private static boolean isMoveKey(int code) {
+        switch (code) {
+            case KeyEvent.KEYCODE_DPAD_LEFT:
+            case KeyEvent.KEYCODE_DPAD_RIGHT:
+            case KeyEvent.KEYCODE_DPAD_UP:
+            case KeyEvent.KEYCODE_DPAD_DOWN:
+            case KeyEvent.KEYCODE_DPAD_CENTER:
+            case KeyEvent.KEYCODE_ENTER:
+            case KeyEvent.KEYCODE_BACK:
+            case KeyEvent.KEYCODE_ESCAPE:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // ------------------------------------------------------------------ actions
+
+    private void launch(AppRepo.App a, View from) {
+        Intent i = getPackageManager().getLeanbackLaunchIntentForPackage(a.pkg);
+        if (i == null) i = getPackageManager().getLaunchIntentForPackage(a.pkg);
+        if (i == null) i = new Intent(Intent.ACTION_MAIN).setComponent(a.component);
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+        Bundle opts = ActivityOptions.makeScaleUpAnimation(from, 0, 0, from.getWidth(), from.getHeight()).toBundle();
+        try {
+            startActivity(i, opts);
+        } catch (RuntimeException ignored) { }
+    }
+
+    private void openSearch() {
+        if (safeStart(new Intent(Intent.ACTION_ASSIST))) return;
+        safeStart(new Intent("android.search.action.GLOBAL_SEARCH"));
+    }
+
+    private boolean safeStart(Intent i) {
+        try {
+            startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+            return true;
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    // ------------------------------------------------------------------ view helpers
+
+    /** A glass element that tracks the wallpaper and the on-screen dark gradients. */
+    private GlassView newGlass(float radius, int overlay) {
+        GlassView g = new GlassView(this, radius, density, overlay);
+        g.setScrims(dp(TOP_SCRIM_DP), (TOP_SCRIM >>> 24) / 255f,
+                screenH - dp(BOTTOM_SCRIM_DP), (BOTTOM_SCRIM >>> 24) / 255f);
+        glasses.add(g);
+        return g;
+    }
+
+    /**
+     * Liquid Glass capsule (icon + label) for the top-right. A light smoke behind the label keeps
+     * it readable over bright skies; focused, it fills solid white with dark text, as on iOS.
+     */
+    private View pill(int icon, String label, View.OnClickListener click) {
+        FrameLayout p = new FrameLayout(this);
+        p.setFocusable(true);
+        p.setContentDescription(label);
+        p.setClipChildren(false);
+        p.addView(newGlass(0, 0x38000000), new FrameLayout.LayoutParams(-1, -1));
+        View fill = new View(this) {
+            @Override protected void onMeasure(int w, int h) {
+                setMeasuredDimension(resolveSize(0, w), resolveSize(0, h)); // size follows the label
+            }
+        };
+        fill.setBackground(round(0xFFFFFFFF, dp(16)));
+        fill.setAlpha(0f);
+        p.addView(fill, new FrameLayout.LayoutParams(-1, -1));
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(13), 0, dp(15), 0);
+        ImageView i = new ImageView(this);
+        i.setImageResource(icon);
+        i.setColorFilter(0xFFFFFFFF);
+        row.addView(i, new LinearLayout.LayoutParams(dp(13), dp(13)));
+        TextView t = text(label, 10.5f, 0xFFFFFFFF, "sans-serif-medium");
+        t.setShadowLayer(dp(3), 0, dp(0.5f), 0x8C000000);
+        LinearLayout.LayoutParams tl = new LinearLayout.LayoutParams(-2, -2);
+        tl.leftMargin = dp(6);
+        row.addView(t, tl);
+        p.addView(row, new FrameLayout.LayoutParams(-2, -1));
+
+        p.setSoundEffectsEnabled(false);
+        p.setOnClickListener(v -> { sounds.select(); click.onClick(v); });
+        p.setOnFocusChangeListener((v, f) -> {
+            fill.animate().alpha(f ? 1f : 0f).setDuration(160).start();
+            i.setColorFilter(f ? 0xFF000000 : 0xFFFFFFFF);
+            t.setTextColor(f ? 0xFF000000 : 0xFFFFFFFF);
+            t.setShadowLayer(f ? 0 : dp(3), 0, f ? 0 : dp(0.5f), 0x8C000000);
+            p.animate().scaleX(f ? 1.08f : 1f).scaleY(f ? 1.08f : 1f).setDuration(220)
+                    .setInterpolator(new android.view.animation.OvershootInterpolator(1.4f)).start();
+        });
+        p.setLayoutParams(new LinearLayout.LayoutParams(-2, dp(32)));
+        return p;
+    }
+
+    private static void caps(TextView t, float tracking) {
+        t.setAllCaps(true);
+        t.setLetterSpacing(tracking);
+    }
+
+    private TextView text(String s, float sp, int color, String family) {
+        TextView t = new TextView(this);
+        t.setText(s);
+        style(t, sp, color, family);
+        return t;
+    }
+
+    private void style(TextView t, float sp, int color, String family) {
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
+        t.setTextColor(color);
+        t.setTypeface(Typeface.create(family, Typeface.NORMAL));
+        t.setIncludeFontPadding(false);
+    }
+
+    private View gradient(int from, int to, GradientDrawable.Orientation o) {
+        View v = new View(this);
+        v.setBackground(new GradientDrawable(o, new int[] { from, to }));
+        return v;
+    }
+
+    private static GradientDrawable round(int color, float radius) {
+        GradientDrawable d = new GradientDrawable();
+        d.setColor(color);
+        d.setCornerRadius(radius);
+        return d;
+    }
+
+    private int dp(float v) {
+        return Math.round(v * density);
+    }
+
+    /** Vertical LinearLayout that is as tall as its content; we scroll it by translation. */
+    static final class TallLayout extends LinearLayout {
+        TallLayout(Context c) { super(c); }
+        @Override protected void onMeasure(int w, int h) {
+            super.onMeasure(w, MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));
+        }
+    }
+
+    /** Horizontal LinearLayout that is as wide as its content; the dock scrolls by translation. */
+    static final class WideLayout extends LinearLayout {
+        WideLayout(Context c) { super(c); }
+        @Override protected void onMeasure(int w, int h) {
+            super.onMeasure(MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED), h);
+        }
+    }
+}

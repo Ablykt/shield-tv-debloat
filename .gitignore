@@ -1,0 +1,13 @@
+# Device backups hold the SHIELD's serial, Android ID, Wi-Fi name, Bluetooth details and
+# screenshots. They stay on this machine; make your own with scripts/backup.sh.
+backup/
+
+# Zen Home's signing key: anyone holding it can ship "updates" the SHIELD will accept.
+launcher/keystore/
+*.jks
+*.keystore
+
+# Build output (rebuild with launcher/build.sh)
+launcher/build/
+
+.DS_Store
